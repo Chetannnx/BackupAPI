@@ -6,42 +6,80 @@ const path = require("path");
 
 const app = express();
 
-// ✅ Middleware
-// app.use(cors({
-//   origin: "http://127.0.0.1:5501",
-//   methods: ["GET", "POST"],
-//   credentials: true
-// }));
-
+// ==========================
+// 🔥 MIDDLEWARE
+// ==========================
 app.use(cors({
   origin: "*",
-  methods: ["GET", "POST"],
+  methods: ["GET", "POST"]
 }));
 
 app.use(express.json());
 
-// 🔥 Backup folder
+// ==========================
+// 🔥 CONFIG
+// ==========================
 const BACKUP_FOLDER = "D:\\Chetan\\DBBackup";
 
 // ==========================
-// 🔥 CREATE FOLDER IF NOT EXISTS
+// 🔥 CREATE BACKUP FOLDER
 // ==========================
 if (!fs.existsSync(BACKUP_FOLDER)) {
   fs.mkdirSync(BACKUP_FOLDER, { recursive: true });
 }
 
 // ==========================
-// 🔥 BACKUP API
+// 🔥 COMMON DB LOGGER
+// ==========================
+async function logOperation(type, status, filePath = null) {
+  let pool;
+  try {
+    pool = await sql.connect(config);
+
+    await pool.request()
+      .input("type", sql.VarChar, type)
+      .input("status", sql.VarChar, status)
+      .input("path", sql.NVarChar, filePath)
+      .query(`
+        INSERT INTO master.dbo.BackupLogs 
+        (OperationType, Status, BackupFilePath)
+        VALUES (@type, @status, @path)
+      `);
+
+  } catch (err) {
+    console.error("❌ Log Error:", err.message);
+  } finally {
+    if (pool) await pool.close();
+  }
+}
+
+// ==========================
+// 🔥 GET LATEST BACKUP FILE
+// ==========================
+function getLatestBackup() {
+  const files = fs.readdirSync(BACKUP_FOLDER)
+    .filter(f => f.endsWith(".bak"))
+    .map(f => ({
+      name: f,
+      time: fs.statSync(path.join(BACKUP_FOLDER, f)).mtime.getTime()
+    }))
+    .sort((a, b) => b.time - a.time);
+
+  return files.length ? files[0].name : null;
+}
+
+// ==========================
+// 🔥 BACKUP API (AUTO / MANUAL)
 // ==========================
 app.post("/api/backup", async (req, res) => {
   let pool;
+  const type = req.body.type || "MANUAL";
 
   try {
     pool = await sql.connect(config);
 
     const fileName = `NexusSQLDB_${Date.now()}.bak`;
-    let filePath = path.join(BACKUP_FOLDER, fileName);
-
+    const filePath = path.join(BACKUP_FOLDER, fileName);
     const sqlPath = filePath.replace(/\\/g, "\\\\");
 
     const query = `
@@ -52,14 +90,20 @@ app.post("/api/backup", async (req, res) => {
 
     await pool.request().query(query);
 
+    // ✅ LOG SUCCESS
+    await logOperation(type, "SUCCESS", filePath);
+
     res.json({
       success: true,
-      message: "Backup created successfully",
+      message: `${type} backup successful`,
       file: fileName
     });
 
   } catch (err) {
-    console.error("❌ Backup Error FULL:", err);
+    console.error("❌ Backup Error:", err);
+
+    // ❌ LOG FAILED
+    await logOperation(type, "FAILED", null);
 
     res.status(500).json({
       success: false,
@@ -67,7 +111,7 @@ app.post("/api/backup", async (req, res) => {
     });
 
   } finally {
-    if (pool) await pool.close();   // 🔥 IMPORTANT
+    if (pool) await pool.close();
   }
 });
 
@@ -92,32 +136,16 @@ app.get("/api/backups", (req, res) => {
 });
 
 // ==========================
-// 🔥 GET LATEST BACKUP
-// ==========================
-function getLatestBackup() {
-  const files = fs.readdirSync(BACKUP_FOLDER)
-    .filter(f => f.endsWith(".bak"))
-    .map(f => ({
-      name: f,
-      time: fs.statSync(path.join(BACKUP_FOLDER, f)).mtime.getTime()
-    }))
-    .sort((a, b) => b.time - a.time);
-
-  return files.length ? files[0].name : null;
-}
-
-// ==========================
 // 🔥 RESTORE API
 // ==========================
 app.post("/api/restore", async (req, res) => {
   let pool;
+  let filePath = req.body.path;
 
   try {
-    pool = await sql.connect(config); // 🔥 now connected to MASTER
+    pool = await sql.connect(config);
 
-    let filePath = req.body.path;
-
-    // ✅ If no path → latest backup
+    // 🔹 If no file → latest backup
     if (!filePath) {
       const latestFile = getLatestBackup();
 
@@ -131,7 +159,7 @@ app.post("/api/restore", async (req, res) => {
       filePath = path.join(BACKUP_FOLDER, latestFile);
     }
 
-    // ✅ Check file exists
+    // 🔹 Check file exists
     if (!fs.existsSync(filePath)) {
       return res.status(400).json({
         success: false,
@@ -143,38 +171,111 @@ app.post("/api/restore", async (req, res) => {
     const sqlPath = filePath.replace(/\\/g, "\\\\");
 
     const query = `
-      USE master;
+  USE master;
 
-      ALTER DATABASE NexusSQLDB
-      SET SINGLE_USER WITH ROLLBACK IMMEDIATE;
+  -- Kill all connections safely
+  ALTER DATABASE NexusSQLDB 
+  SET SINGLE_USER WITH ROLLBACK IMMEDIATE;
 
-      RESTORE DATABASE NexusSQLDB
-      FROM DISK = N'${sqlPath}'
-      WITH REPLACE;
+  -- Restore with progress
+  RESTORE DATABASE NexusSQLDB
+  FROM DISK = N'${sqlPath}'
+  WITH REPLACE, RECOVERY, STATS = 10;
 
-      ALTER DATABASE NexusSQLDB
-      SET MULTI_USER;
-    `;
+  -- Set back to multi user
+  ALTER DATABASE NexusSQLDB 
+  SET MULTI_USER;
+`;
 
     await pool.request().query(query);
 
+    // ✅ LOG SUCCESS
+    await logOperation("RESTORE", "SUCCESS", filePath);
+
     res.json({
       success: true,
-      message: "Database restored successfully",
+      message: "Restore successful",
       file: filePath
     });
 
   } catch (err) {
-    console.error("❌ Restore Error FULL:", err);
+    console.error("❌ Restore Error:", err);
+
+    // ❌ LOG FAILED
+    await logOperation("RESTORE", "FAILED", filePath || null);
 
     res.status(500).json({
       success: false,
-      message: err.message,
-      details: err.originalError?.message || ""
+      message: err.message
     });
 
   } finally {
-    if (pool) await pool.close();   // 🔥 VERY IMPORTANT
+    if (pool) await pool.close();
+  }
+});
+
+// ==========================
+// 🔥 STATUS API (LATEST TIMES)
+// ==========================
+app.get("/api/status", async (req, res) => {
+  let pool;
+
+  try {
+    pool = await sql.connect(config);
+
+    const result = await pool.request().query(`
+      SELECT OperationType, MAX(CreatedAt) AS LastTime
+      FROM master.dbo.BackupLogs
+      WHERE Status = 'SUCCESS'
+      GROUP BY OperationType
+    `);
+
+    const data = {
+      auto: null,
+      manual: null,
+      restore: null
+    };
+
+    result.recordset.forEach(row => {
+      if (row.OperationType === "AUTO") data.auto = row.LastTime;
+      if (row.OperationType === "MANUAL") data.manual = row.LastTime;
+      if (row.OperationType === "RESTORE") data.restore = row.LastTime;
+    });
+
+    res.json(data);
+
+  } catch (err) {
+    console.error("❌ Status Error:", err);
+    res.status(500).json({ message: "Status fetch failed" });
+
+  } finally {
+    if (pool) await pool.close();
+  }
+});
+
+
+app.get("/api/files", (req, res) => {
+  const requestedPath = req.query.path || "D:\\";
+
+  try {
+    const items = fs.readdirSync(requestedPath).map(name => {
+      const fullPath = path.join(requestedPath, name);
+      const isDir = fs.statSync(fullPath).isDirectory();
+
+      return {
+        name,
+        path: fullPath,
+        type: isDir ? "folder" : "file"
+      };
+    });
+
+    res.json({
+      currentPath: requestedPath,
+      items
+    });
+
+  } catch (err) {
+    res.status(500).json({ message: "Cannot read path" });
   }
 });
 
@@ -182,6 +283,7 @@ app.post("/api/restore", async (req, res) => {
 // 🔥 START SERVER
 // ==========================
 const PORT = 3000;
+
 app.listen(PORT, () => {
-  console.log(`🚀 Server running on http://localhost:${PORT}`);
+  console.log(`🚀 Server running at http://localhost:${PORT}`);
 });
